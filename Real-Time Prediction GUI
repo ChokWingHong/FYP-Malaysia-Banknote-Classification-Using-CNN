@@ -1,0 +1,158 @@
+import os
+import re
+import cv2
+import time
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+from threading import Thread
+from functools import partial
+from PIL import Image, ImageTk
+from tensorflow.keras.models import load_model
+
+
+def preprocess_image(image_paths_or_dir, progress_callback=None, single_image_mode=False):
+    img_height, img_width = 64, 64
+    images = []
+    labels = []
+    label_list = [1, 5, 10, 20, 50, 100]
+    label_map = {"RM" + str(x): i for i, x in enumerate(label_list)}
+
+    if single_image_mode:
+        all_paths = image_paths_or_dir
+    else:
+        all_files = [f for f in os.listdir(image_paths_or_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        all_paths = [os.path.join(image_paths_or_dir, f) for f in all_files]
+
+    for img_path in all_paths:
+        try:
+            filename = os.path.basename(img_path)
+            denomination_match = re.match(r'(\d+)', filename)
+            label_index = -1
+            if denomination_match:
+                denom = "RM" + denomination_match.group(1)
+                if denom in label_map:
+                    label_index = label_map[denom]
+
+            img = cv2.imread(img_path)
+            if img is None: continue
+            img = cv2.resize(img, (img_width, img_height))
+            img = img / 255.0
+            images.append(img)
+            labels.append(label_index)
+        except Exception as e:
+            print(f"Error: {e}")
+            continue
+    return images, labels
+
+
+class BanknoteClassifierApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("💰 Banknote Classifier GUI")
+        master.geometry("850x900")
+
+        self.target_names = ["RM1", "RM5", "RM10", "RM20", "RM50", "RM100"]
+        self.model = None
+        self.model_path = "banknote_classifier_custom109.keras"
+        self.single_image_path = tk.StringVar()
+        self.tk_image = None
+
+        try:
+            self.model = load_model(self.model_path)
+            print(f"Model loaded successfully from: {self.model_path}")
+        except Exception as e:
+            print(f"Model load error (check path): {e}")
+
+        self.main_frame = ttk.Frame(master, padding="20")
+        self.main_frame.pack(fill='both', expand=True)
+        self.create_single_image_prediction_section(self.main_frame)
+
+    def create_single_image_prediction_section(self, parent):
+        ttk.Label(parent, text="Single Banknote Image Prediction", font=('Arial', 14, 'bold')).pack(pady=(5, 15))
+        self.create_path_selector(parent, "Select Image File:", self.single_image_path, "Select Banknote Image",
+                                  is_dir=False).pack(fill='x', pady=5)
+
+        self.single_predict_button = ttk.Button(parent, text="Classify Single Image",
+                                                command=self.start_single_predict_thread)
+        if self.model is None:
+            self.single_predict_button.config(state=tk.DISABLED)
+        self.single_predict_button.pack(fill='x', pady=5)
+
+        self.single_result_label = ttk.Label(parent, text="Result: Waiting for input...",
+                                             font=('Arial', 11), justify=tk.LEFT)
+        self.single_result_label.pack(pady=10, fill='x')
+
+        self.image_display_frame = ttk.Frame(parent, relief=tk.RIDGE, borderwidth=2)
+        self.image_display_frame.pack(pady=10, fill='both', expand=True)
+        self.image_label = tk.Label(self.image_display_frame, text="Image Preview Area",
+                                    bg='#e1e1e1')
+        self.image_label.pack(padx=5, pady=5, expand=True)
+
+    def create_path_selector(self, parent, label_text, path_var, dialog_title, is_dir=True):
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text=label_text, width=15).pack(side='left')
+        ttk.Entry(frame, textvariable=path_var).pack(side='left', fill='x', expand=True, padx=5)
+
+        cmd = partial(self.select_directory, path_var, dialog_title) if is_dir else partial(self.select_file, path_var,
+                                                                                            dialog_title)
+        ttk.Button(frame, text="Browse", command=cmd).pack(side='right')
+        return frame
+
+    def select_directory(self, path_var, dialog_title):
+        d = filedialog.askdirectory(title=dialog_title)
+        if d: path_var.set(d)
+
+    def select_file(self, path_var, dialog_title):
+        f = filedialog.askopenfilename(title=dialog_title, filetypes=(("Images", "*.jpg;*.png;*.jpeg"), ("All", "*.*")))
+        if f:
+            path_var.set(f)
+            self.single_result_label.config(text="Result: Ready to classify")
+            self.image_label.config(image=None, text="Image Preview Area")
+            self.tk_image = None
+            if self.model:
+                self.single_predict_button.config(state=tk.NORMAL)
+
+    def start_single_predict_thread(self):
+        path = self.single_image_path.get()
+        if not os.path.isfile(path):
+            messagebox.showerror("Error", "Invalid file.")
+            return
+
+        self.single_predict_button.config(state=tk.DISABLED, text="Classifying...")
+        self.single_result_label.config(text="Result: Processing...")
+
+        Thread(target=self.single_prediction_worker, args=([path],)).start()
+
+    def single_prediction_worker(self, image_paths):
+        path = image_paths[0]
+        try:
+            pil_img = Image.open(path)
+            display_size = 320
+            display_img = pil_img.resize((display_size, display_size), Image.Resampling.LANCZOS)
+            self.tk_image = ImageTk.PhotoImage(display_img)
+
+            self.master.after(0, lambda: self.image_label.config(image=self.tk_image, text="", width=display_size,
+                                                                 height=display_size))
+            x_test, labels = preprocess_image(image_paths, single_image_mode=True)
+            if not x_test: raise Exception("Preprocessing failed")
+            x_test = np.array(x_test)
+            y_pred = self.model.predict(x_test, verbose=0)
+            idx = np.argmax(y_pred[0])
+            conf = np.max(y_pred[0]) * 100
+            pred_lbl = self.target_names[idx]
+            true_lbl = self.target_names[labels[0]] if labels and labels[0] != -1 else "Unknown"
+            res_txt = f"Result:\nPredicted: {pred_lbl}\nConfidence: {conf:.2f}%\nTrue Label: {true_lbl}"
+            self.master.after(0, lambda: self.single_result_label.config(text=res_txt))
+
+        except Exception as e:
+            self.master.after(0, lambda: messagebox.showerror("Error", str(e)))
+        finally:
+            self.master.after(0,
+                              lambda: self.single_predict_button.config(state=tk.NORMAL, text="Classify Single Image"))
+
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = BanknoteClassifierApp(root)
+    root.mainloop()

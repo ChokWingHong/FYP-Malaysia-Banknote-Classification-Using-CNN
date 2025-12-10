@@ -1,0 +1,190 @@
+import os
+import re
+import cv2
+import time
+import tensorflow as tf
+from tqdm import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras import layers, models
+from tensorflow.keras import Input
+from tensorflow.keras.models import load_model
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+
+def preprocess_image(image_dir):
+    img_height, img_width = 64, 64
+    images = []
+    labels = []
+    label_list = [1, 5, 10, 20, 50, 100]
+    label_map = {"RM" + str(x): i for i, x in enumerate(label_list)}
+
+    for filename in tqdm(os.listdir(image_dir)):
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            try:
+                denomination_match = re.match(r'(\d+)', filename)
+                if denomination_match:
+                    denom = "RM" + denomination_match.group(1)
+                    if denom not in label_map:
+                        continue
+
+                    label = label_map[denom]
+                    img_path = os.path.join(image_dir, filename)
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        continue
+
+                    img = cv2.resize(img, (img_width, img_height))
+                    img = img / 255.0
+
+                    images.append(img)
+                    labels.append(label)
+
+            except Exception as e:
+                print(f"Error processing {filename}: {e}")
+                continue
+    return images, labels
+
+def con_mat(cm, target_names):
+    # --- Calculate Percentages and Labels (Same as before) ---
+    cm_row_sums = cm.sum(axis=1, keepdims=True)
+    # Avoid division by zero if a class has no true instances
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cm_percent = np.divide(
+            cm,
+            cm_row_sums,
+            out=np.zeros_like(cm, dtype=float),
+            where=cm_row_sums != 0) * 100
+
+    labels = (np.asarray([f"{count}\n({perc:.2f}%)"
+                          for count, perc in zip(cm.flatten(), cm_percent.flatten())])
+              ).reshape(cm.shape)
+
+    # --- Plotting setup ---
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Create a mask for the diagonal elements.
+    # np.eye creates an identity matrix (1s on diagonal, 0s elsewhere).
+    # We convert it to booleans. True = Diagonal.
+    diag_mask = np.eye(cm.shape[0], dtype=bool)
+
+    # --- LAYER 1: Off-Diagonal (Errors) ---
+    # We use a contrasting color map, like 'Reds' or 'Oranges', to highlight errors.
+    sns.heatmap(
+        cm,
+        annot=labels,
+        fmt='',
+        xticklabels=target_names,
+        yticklabels=target_names,
+        cmap='Reds',    # <-- Distinct gradient for errors
+        mask=diag_mask,
+        vmin=0,  # <--- Anchor for lightest color
+        vmax=30,        # <-- Mask OUT the diagonal cells
+        cbar=True,     # Turn off colorbar for this layer to avoid clutter
+        ax=ax           # Plot onto the defined axes
+    )
+
+    # --- LAYER 2: Diagonal (Correct Predictions) ---
+    # We overlay this on the same axes.
+    sns.heatmap(
+        cm,
+        annot=labels,
+        fmt='',
+        xticklabels=target_names,
+        yticklabels=target_names,
+        cmap='Blues',    # <-- Keep Blues for correct predictions
+        mask=~diag_mask,
+        vmin=0,  # <--- Anchor for lightest color
+        vmax=150,        # <-- Mask OUT the off-diagonal cells (the inverse mask)
+        cbar=True,       # Keep the colorbar for the main diagonal values
+        ax=ax            # Plot onto the same axes
+    )
+
+    plt.xlabel('Predicted Class')
+    plt.ylabel('True Class')
+    plt.title('Confusion Matrix: Count and Row Percentage')
+    plt.show()
+
+def train_model(images_dir):
+    images , labels = preprocess_image(images_dir)
+    X = np.array(images)
+    y = to_categorical(labels)
+    start_time_total = time.time()
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = models.Sequential([
+        Input(shape=(64, 64, 3)),
+        layers.Conv2D(32, (3, 3), activation='relu'),
+        layers.MaxPooling2D(2, 2),
+        layers.Conv2D(64, (3, 3), activation='relu'),
+        layers.MaxPooling2D(2, 2),
+        layers.Conv2D(128, (3, 3), activation='relu'),
+        layers.MaxPooling2D(2, 2),
+        layers.Conv2D(128, (3, 3), activation='relu'),
+        layers.MaxPooling2D(2, 2),
+        layers.Flatten(),
+        layers.Dense(128, activation='relu'),
+        layers.Dropout(0.5),
+        layers.Dense(6, activation='softmax')])
+
+    model.compile(optimizer='adam',
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy'])
+
+    history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=16)
+    end_time_total = time.time()
+    total_training_time = end_time_total - start_time_total
+    print(f"\n[TIMING] Total Model Training Time: {total_training_time:.2f} seconds")
+    y_pred = model.predict(X_val)
+    y_pred_labels = np.argmax(y_pred, axis=1)
+    y_true = np.argmax(y_val, axis=1)
+    label_ids = [0, 1, 2, 3, 4, 5]
+    target_names = [f"RM{x}" for x in [1, 5, 10, 20, 50, 100]]
+    cm = confusion_matrix(y_true, y_pred_labels)
+    correct_predictions = cm.diagonal()
+    total_actual_samples = np.sum(cm, axis=1)
+    print("\n--- Class-Specific Performance (Valid Set) ---")
+    for i, name in enumerate(target_names):
+        correct = correct_predictions[i]
+        total = total_actual_samples[i]
+        recall = correct / total if total > 0 else 0.0
+        print(f"  {name}: {correct} correct / {total} total (Recall: {recall:.4f})")
+    print("--------------------------------------------------")
+    print(classification_report(y_true, y_pred_labels,labels=label_ids ,target_names=target_names,digits=4))
+    con_mat(cm,target_names)
+    model.save("banknote_classifier_custom1011.keras")
+
+def prediction(images_dir):
+    try:
+        model = load_model("banknote_classifier_custom108.keras")
+    except Exception as e:
+        print(f"Error: Could not load model. Please ensure it was successfully trained and saved.")
+        return
+    start_time_pred = time.time()
+    x_test, y_test = preprocess_image(images_dir)
+    x_test = np.array(x_test)
+    y_test_categorical = to_categorical(y_test)
+    y_pred = model.predict(x_test)
+    end_time_pred = time.time()
+    prediction_time = end_time_pred - start_time_pred
+    num_test_images = len(x_test)
+    y_pred_labels = np.argmax(y_pred, axis=1)
+    y_true = np.argmax(y_test_categorical, axis=1)
+    target_names = ["RM1", "RM5", "RM10", "RM20", "RM50", "RM100"]
+    print(f"\nTotal Prediction Time for {num_test_images} images: {prediction_time:.4f} seconds")
+    print(classification_report(y_true, y_pred_labels, target_names=target_names,digits=4))
+    cm = confusion_matrix(y_true, y_pred_labels)
+    correct_predictions = cm.diagonal()
+    total_actual_samples = np.sum(cm, axis=1)
+    print("\n--- Class-Specific Performance (Test Set) ---")
+    for i, name in enumerate(target_names):
+        correct = correct_predictions[i]
+        total = total_actual_samples[i]
+        recall = correct / total if total > 0 else 0.0
+        print(f"  {name}: {correct} correct / {total} total (Recall: {recall:.4f})")
+    print("--------------------------------------------------")
+    con_mat(cm,target_names)
+
+#train_model(r"C:\Users\User\OneDrive\Y3S2\FYP\Banknote\DatasetT2\train")
+#prediction(r"C:\Users\User\OneDrive\Y3S2\FYP\Banknote\DatasetT2\test")
